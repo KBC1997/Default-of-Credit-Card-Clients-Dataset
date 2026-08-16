@@ -22,8 +22,8 @@ This project implements an end-to-end machine learning solution to classify whet
 ---
 
 ## 3. GitHub Repository Link
-- **GitHub Repository:** [https://github.com/YOUR_GITHUB_USERNAME/Asset-Management-Credit-Default](https://github.com/YOUR_GITHUB_USERNAME/Asset-Management-Credit-Default)[cite: 4]
-- **Live Streamlit App:** [https://YOUR_APP_NAME.streamlit.app](https://YOUR_APP_NAME.streamlit.app)[cite: 4]
+- **GitHub Repository:** https://github.com/KBC1997/Default-of-Credit-Card-Clients-Dataset/tree/main [cite: 4]
+- **Live Streamlit App:** https://kbc1997-default-of-credit-card-clients-dat-streamlit-app-lc3thy.streamlit.app/ [cite: 4]
 
 ---
 
