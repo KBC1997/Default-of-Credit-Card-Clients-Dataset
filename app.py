@@ -11,7 +11,7 @@ from sklearn.metrics import (
     confusion_matrix, classification_report
 )
 
-# Page Configuration
+# Page Setup
 st.set_page_config(
     page_title="Asset Management Credit Default App",
     page_icon="💳",
@@ -19,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Model File Directory Map
+# Model Directory Mapping
 model_file_map = {
     "Logistic Regression": "model/logistic_regression.pkl",
     "Decision Tree": "model/decision_tree.pkl",
@@ -28,7 +28,6 @@ model_file_map = {
     "Random Forest (Ensemble)": "model/random_forest_ensemble.pkl"
 }
 
-# Sidebar Controls
 st.sidebar.header("⚙️ User Controls")
 
 uploaded_file = st.sidebar.file_uploader(
@@ -43,25 +42,47 @@ model_choice = st.sidebar.selectbox(
     index=4  # Default to Random Forest (Ensemble)
 )
 
-# Flexible Data Ingestion Function (Supports CSV and Excel)
+# Robust CSV reader guard against quoted single-column Excel re-saves
+def _read_csv_robust(file_obj_or_path):
+    df = pd.read_csv(file_obj_or_path)
+    if df.shape[1] == 1:
+        col_name = df.columns[0]
+        if ',' in col_name:
+            if hasattr(file_obj_or_path, 'seek'):
+                file_obj_or_path.seek(0)
+            df = pd.read_csv(
+                file_obj_or_path,
+                quotechar='"',
+                skipinitialspace=True,
+            )
+            if df.shape[1] == 1:
+                split_cols = [c.strip() for c in col_name.split(',')]
+                values = df[col_name].astype(str).str.split(',', expand=True)
+                values.columns = split_cols
+                df = values
+    return df
+
+# Data Ingestion Function
 def load_eval_data():
+    # 1. Custom Uploaded File
     if uploaded_file is not None:
         file_name = uploaded_file.name.lower()
         if file_name.endswith('.csv'):
             try:
-                df = pd.read_csv(uploaded_file)
+                df = _read_csv_robust(uploaded_file)
             except Exception:
                 uploaded_file.seek(0)
                 df = pd.read_excel(uploaded_file, header=0)
         else:
             try:
-                df = pd.read_excel(uploaded_file, header=0, engine='openpyxl')
+                df = pd.read_excel(uploaded_file, header=0)
             except Exception:
                 uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file)
-        source_label = f"Uploaded Dataset: `{uploaded_file.name}`"
+                df = _read_csv_robust(uploaded_file)
+        source_label = f"Uploaded File (`{uploaded_file.name}`)"
         dataset_name = uploaded_file.name
     
+    # 2. Default Display Fallback (test_data.csv)
     else:
         found_file = None
         for candidate in ['test_data.csv', 'test_data.xls', 'test_data.xlsx']:
@@ -70,64 +91,112 @@ def load_eval_data():
                 break
 
         if found_file is None:
-            st.error("❌ No default test file (`test_data.csv`) found in root directory!")
+            st.error("❌ `test_data.csv` was not found in the root directory! Run model training first.")
             st.stop()
 
         try:
-            df = pd.read_csv(found_file)
+            df = _read_csv_robust(found_file)
         except Exception:
             df = pd.read_excel(found_file, header=0)
             
-        source_label = f"Default Baseline: `{found_file}`"
+        source_label = f"Default Baseline (`{found_file}`)"
         dataset_name = found_file
     
     # Clean column headers
     df.columns = [str(c).strip() for c in df.columns]
 
-    # Automatically drop primary key / ID columns
+    # Drop explicit primary key / ID columns if present
     id_cols = [c for c in df.columns if c.lower() in ['id', 'unnamed: 0', 'index', 'customer_id']]
     if id_cols:
         df.drop(columns=id_cols, inplace=True)
 
-    # Dynamic target column matching
-    target_cols = [c for c in df.columns if 'default' in c.lower()]
-    if not target_cols:
-        st.error("❌ Target column containing 'default' keyword was not found in dataset.")
+    # Flexible Target Column Matching Logic:
+    # 1. Look for exact match 'default'
+    # 2. Look for fuzzy substring containing 'default'
+    # 3. Fallback to using the LAST column as the target variable
+    exact_matches = [c for c in df.columns if c.lower() == 'default']
+    if exact_matches:
+        target_col = exact_matches[0]
+    else:
+        fuzzy_matches = [c for c in df.columns if 'default' in c.lower()]
+        if fuzzy_matches:
+            target_col = fuzzy_matches[0]
+        else:
+            target_col = df.columns[-1]
+
+    df.rename(columns={target_col: 'default'}, inplace=True)
+
+    if df.shape[1] < 2:
+        st.error(
+            f"❌ Only 1 column was detected in `{dataset_name}`. "
+            "Please ensure the file has valid features and comma delimiting."
+        )
         st.stop()
-    
-    df.rename(columns={target_cols[0]: 'default'}, inplace=True)
+
     return df, source_label, dataset_name
 
 df_test, data_source, active_file_name = load_eval_data()
 
-# Dynamic Title based on active dataset
+# Dynamic Header Title
 st.title("💳 Asset Management: Credit Card Default Risk Classifier")
-st.markdown(f"**Current Evaluation Target:** Running live model inference on **`{active_file_name}`** ({len(df_test):,} instances, {df_test.shape[1]-1} features).")
+st.markdown(f"**Current Evaluation Target:** Running live model inference on **`{active_file_name}`** ({len(df_test):,} records).")
 st.divider()
 
 st.sidebar.info(f"📊 Active File: **{active_file_name}**\n\nTotal Records: **{len(df_test):,}**")
 
-X_test = df_test.drop(columns=['default'])
-y_test = df_test['default']
+# Separate Features (X) and Target (y)
+X_test_raw = df_test.drop(columns=['default'])
+y_test = pd.to_numeric(df_test['default'], errors='coerce').fillna(0).astype(int).to_numpy()
 
-# Compute all 6 metrics live across all 5 models directly from active dataset
-@st.cache_data
-def evaluate_all_models_live(_X, _y):
+# Clean input matrix as float64 contiguous numpy array
+X_test_matrix = np.ascontiguousarray(
+    X_test_raw.apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy(dtype=np.float64)
+)
+
+# Helper function to align features and perform safe model prediction
+def safe_predict(pipeline, X_input):
+    if isinstance(X_input, pd.DataFrame):
+        arr = X_input.to_numpy(dtype=np.float64)
+    else:
+        arr = np.asarray(X_input, dtype=np.float64)
+        
+    arr = np.nan_to_num(arr, nan=0.0)
+    
+    if hasattr(pipeline, "feature_names_in_"):
+        expected_cols = pipeline.feature_names_in_
+        if len(expected_cols) == arr.shape[1]:
+            X_eval = pd.DataFrame(arr, columns=expected_cols, dtype=np.float64)
+        else:
+            X_eval = arr
+    else:
+        X_eval = arr
+
+    y_pred = pipeline.predict(X_eval)
+    
+    if hasattr(pipeline, "predict_proba"):
+        y_proba = pipeline.predict_proba(X_eval)[:, 1]
+    else:
+        y_proba = y_pred
+        
+    return y_pred, y_proba
+
+# Compute metrics across all 5 models
+def evaluate_all_models_live(X_mat, y_true):
     summary_results = []
     for model_name, path in model_file_map.items():
         if os.path.exists(path):
             pipe = joblib.load(path)
-            y_pred = pipe.predict(_X)
-            y_proba = pipe.predict_proba(_X)[:, 1] if hasattr(pipe, "predict_proba") else y_pred
+            
+            y_pred, y_proba = safe_predict(pipe, X_mat)
             
             summary_results.append({
                 'ML Model Name': model_name,
-                'Accuracy': round(accuracy_score(_y, y_pred), 4),
-                'AUC': round(roc_auc_score(_y, y_proba), 4),
-                'Precision': round(precision_score(_y, y_pred, zero_division=0), 4),
-                'Recall': round(recall_score(_y, y_pred, zero_division=0), 4),
-                'F1': round(f1_score(_y, y_pred, zero_division=0), 4),
-                'MCC': round(matthews_corrcoef(_y, y_pred), 4)
+                'Accuracy': round(accuracy_score(y_true, y_pred), 4),
+                'AUC': round(roc_auc_score(y_true, y_proba), 4),
+                'Precision': round(precision_score(y_true, y_pred, zero_division=0), 4),
+                'Recall': round(recall_score(y_true, y_pred, zero_division=0), 4),
+                'F1': round(f1_score(y_true, y_pred, zero_division=0), 4),
+                'MCC': round(matthews_corrcoef(y_true, y_pred), 4)
             })
     return pd.DataFrame(summary_results)
 
@@ -145,12 +214,11 @@ tab1, tab2, tab3 = st.tabs(["📊 Model Comparison Table", "🔍 Single Model In
 # TAB 1: LIVE MODEL COMPARISON TABLE
 with tab1:
     st.subheader(f"🏆 Model Performance Comparison — `{active_file_name}`")
-    st.markdown("Live evaluation of all 5 classification pipelines calculated directly on the active dataset:")
+    st.markdown("Live evaluation of all 5 classification pipelines calculated directly on test data:")
     
-    summary_df = evaluate_all_models_live(X_test, y_test)
+    summary_df = evaluate_all_models_live(X_test_matrix, y_test)
     
     if not summary_df.empty:
-        # High-contrast styled table display
         styled_table = style_high_contrast(summary_df)
         st.dataframe(
             styled_table,
@@ -158,7 +226,6 @@ with tab1:
             hide_index=True
         )
         
-        # Best performing model callout
         best_idx = summary_df['AUC'].idxmax()
         winner_name = summary_df.loc[best_idx, 'ML Model Name']
         winner_auc = summary_df.loc[best_idx, 'AUC']
@@ -177,8 +244,7 @@ with tab2:
         st.error(f"Model file `{model_path}` not found.")
     else:
         pipeline = joblib.load(model_path)
-        y_pred = pipeline.predict(X_test)
-        y_proba = pipeline.predict_proba(X_test)[:, 1] if hasattr(pipeline, "predict_proba") else y_pred
+        y_pred, y_proba = safe_predict(pipeline, X_test_matrix)
         
         acc = accuracy_score(y_test, y_pred)
         auc = roc_auc_score(y_test, y_proba)
@@ -187,7 +253,6 @@ with tab2:
         f1 = f1_score(y_test, y_pred, zero_division=0)
         mcc = matthews_corrcoef(y_test, y_pred)
         
-        # Display 6 Metric Cards
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("Accuracy", f"{acc:.4f}")
         col2.metric("AUC Score", f"{auc:.4f}")
